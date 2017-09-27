@@ -1,0 +1,6 @@
+[run]
+branch = True
+source = networking_lagopus
+
+[report]
+ignore_errors = True
