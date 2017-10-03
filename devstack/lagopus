@@ -1,0 +1,130 @@
+#!/bin/bash
+
+#    Licensed under the Apache License, Version 2.0 (the "License"); you may
+#    not use this file except in compliance with the License. You may obtain
+#    a copy of the License at
+#
+#         http://www.apache.org/licenses/LICENSE-2.0
+#
+#    Unless required by applicable law or agreed to in writing, software
+#    distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
+#    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+#    License for the specific language governing permissions and limitations
+#    under the License.
+
+# Save trace setting
+_XTRACE_NEUTRON_LAGOPUS=$(set +o | grep xtrace)
+set +o xtrace
+
+function install_lagopus {
+    git_clone $LAGOPUS_REPO $LAGOPUS_DIR $LAGOPUS_BRANCH
+    cd $LAGOPUS_DIR
+    ./configure --enable-hybrid
+    make
+    sudo make install
+}
+
+function generate_dsl {
+    local dir=${GITDIR['networking-lagopus']}
+    sudo mkdir -p $LAGOPUS_CONF_DIR
+    sudo python $dir/devstack/generate_dsl.py \
+        $DPDK_PORT_MAPPINGS $LAGOPUS_CONF_DIR/$LAGOPUS_CONF
+}
+
+function run_lagopus {
+    echo "run_lagopus"
+    generate_dsl
+    sudo lagopus -C $LAGOPUS_CONF_DIR/$LAGOPUS_CONF -l $LAGOPUS_LOG \
+        -- -c $LAGOPUS_CORE_MASK -n1 --socket-mem $LAGOPUS_SOCKET_MEM \
+        --huge-dir $LAGOPUS_HUGEPAGE_MOUNT -- --core-assign balance
+}
+
+function stop_lagopus {
+    echo "stop_lagopus"
+    sudo pkill -15 -f "lagopus -C $LAGOPUS_CONF_DIR/$LAGOPUS_CONF"
+    sudo rm -f /tmp/sock*
+}
+
+function free_hugepages(){
+    HUGEPAGE_SIZE=$(grep Hugepagesize /proc/meminfo | awk '{ print $2 }')
+
+    sudo rm -rf ${LAGOPUS_HUGEPAGE_MOUNT}/rtemap*
+    sudo umount ${LAGOPUS_HUGEPAGE_MOUNT}
+
+    if [ $LAGOPUS_ALLOCATE_HUGEPAGES == 'True' ]; then
+       for d in /sys/devices/system/node/node? ; do
+          echo 0 | sudo tee $d/hugepages/hugepages-${HUGEPAGE_SIZE}kB/nr_hugepages
+       done
+    fi
+
+    #TODO: restart libvirtd ?
+}
+
+function alloc_hugepages(){
+    HUGEPAGE_SIZE=$(grep Hugepagesize /proc/meminfo | awk '{ print $2 }')
+
+    if [ $LAGOPUS_NUM_HUGEPAGES -eq 0 ]; then
+        die 6 $LINENO "LAGOPUS_NUM_HUGEPAGES not set"
+    fi
+
+    if grep -ws $LAGOPUS_HUGEPAGE_MOUNT /proc/mounts > /dev/null; then
+        free_hugepages
+    fi
+
+    if [ $LAGOPUS_ALLOCATE_HUGEPAGES == 'True' ]; then
+        for d in /sys/devices/system/node/node? ; do
+            echo $LAGOPUS_NUM_HUGEPAGES | sudo tee $d/hugepages/hugepages-${HUGEPAGE_SIZE}kB/nr_hugepages
+        done
+    fi
+
+    sudo mkdir -p $LAGOPUS_HUGEPAGE_MOUNT
+    sudo mount -t hugetlbfs nodev $LAGOPUS_HUGEPAGE_MOUNT
+
+    #TODO: restart libvirtd ?
+}
+
+function bind_nics() {
+    if [ -n "$DPDK_PORT_MAPPINGS" ]; then
+        sudo modprobe uio
+        if ! lsmod | grep -ws igb_uio > /dev/null; then
+            sudo insmod $DPDK_DIR/build/kmod/igb_uio.ko
+        fi
+
+        MAPPINGS=${DPDK_PORT_MAPPINGS//,/ }
+        ARRAY=( $MAPPINGS )
+        NICS=""
+        for pair in "${ARRAY[@]}"; do
+            addr=`echo $pair | cut -f 1 -d "#"`
+            NICS="$NICS $addr"
+        done
+        sudo $DPDK_DIR/usertools/dpdk-devbind.py -b igb_uio $NICS
+    fi
+}
+
+function unbind_nics() {
+    if [ -n "$DPDK_PORT_MAPPINGS" ]; then
+        MAPPINGS=${DPDK_PORT_MAPPINGS//,/ }
+        ARRAY=( $MAPPINGS )
+        NICS=""
+        for pair in "${ARRAY[@]}"; do
+            addr=`echo $pair | cut -f 1 -d "#"`
+            NICS="$NICS $addr"
+        done
+        sudo $DPDK_DIR/usertools/dpdk-devbind.py -b e1000 $NICS
+    fi
+}
+
+function prepare_lagopus(){
+    alloc_hugepages
+    bind_nics
+}
+
+function cleanup_lagopus(){
+    unbind_nics
+    if grep -ws $LAGOPUS_HUGEPAGE_MOUNT /proc/mounts > /dev/null; then
+        free_hugepages
+    fi
+}
+
+# Restore xtrace
+$_XTRACE_NEUTRON_LAGOPUS

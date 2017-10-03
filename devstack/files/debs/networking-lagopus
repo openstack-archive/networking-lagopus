@@ -1,0 +1,9 @@
+build-essential
+libexpat-dev
+libgmp-dev
+libssl-dev
+libpcap-dev
+byacc
+flex
+python-dev
+python-twisted
