@@ -30,6 +30,7 @@ from neutron.common import config as common_config
 from neutron.common import rpc as n_rpc
 from neutron.common import topics
 from neutron.plugins.common import constants as p_constants
+from neutron.plugins.ml2.drivers.agent import config as agent_config  # noqa
 
 from networking_lagopus.agent import lagopus_lib
 from networking_lagopus.common import config  # noqa
