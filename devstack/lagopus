@@ -27,7 +27,8 @@ function install_lagopus {
 function generate_dsl {
     local dir=${GITDIR['networking-lagopus']}
     sudo mkdir -p $LAGOPUS_CONF_DIR
-    sudo python $dir/devstack/generate_dsl.py \
+    cd $dir/devstack
+    sudo python generate_dsl.py \
         $DPDK_PORT_MAPPINGS $LAGOPUS_CONF_DIR/$LAGOPUS_CONF
 }
 
