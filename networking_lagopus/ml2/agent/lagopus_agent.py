@@ -40,16 +40,13 @@ LOG = logging.getLogger(__name__)
 
 LAGOPUS_AGENT_BINARY = 'neutron-lagopus-agent'
 AGENT_TYPE_LAGOPUS = 'Lagopus agent'
-EXTENSION_DRIVER_TYPE = 'lagopus'
-LAGOPUS_FS = "/sys/class/net/"
-RESOURCE_ID_LENGTH = 11
-
+MAX_WAIT_LAGOPUS_RETRY = 5
 OFPP_MAX = 0xffffff00
 
 
 class LagopusBridge(object):
 
-    def __init__(self, ryu_app, name, dpid, port_data, wait_connection=True):
+    def __init__(self, ryu_app, name, dpid, port_data):
         LOG.debug("LagopusBridge: %s %s", name, dpid)
         self.ryu_app = ryu_app
         self.name = name
@@ -183,11 +180,7 @@ class LagopusManager(object):
         self.bridge_mappings = bridge_mappings
         self.ryu_app = ryu_app
 
-        raw_bridges = self.lagopus_client.show_bridges()
-        if not raw_bridges:
-            LOG.error("Lagopus isn't running")
-            sys.exit(1)
-        LOG.debug("bridges: %s", raw_bridges)
+        raw_bridges = self._get_init_bridges()
 
         self.bridges = {}
         name_to_dpid = {}
@@ -232,6 +225,17 @@ class LagopusManager(object):
                            if inter["device"].startswith("eth_pipe")]
         self.num_pipe = len(pipe_interfaces)
         # TODO(hichihara) pipe interface does not remove now.
+
+    def _get_init_bridges(self):
+        for retry in range(MAX_WAIT_LAGOPUS_RETRY):
+            raw_bridges = self.lagopus_client.show_bridges()
+            if raw_bridges:
+                LOG.debug("bridges: %s", raw_bridges)
+                return raw_bridges
+            LOG.debug("Lagopus may not be initialized. waiting")
+            eventlet.sleep(10)
+        LOG.error("Lagopus isn't running")
+        sys.exit(1)
 
     def get_vhost_interface(self):
         if self.num_vhost == len(self.used_vhost_id):
@@ -287,6 +291,24 @@ class LagopusManager(object):
         LOG.debug("get_all_devices: %s", devices)
         return devices
 
+    def _create_channel(self, channel):
+        data = self.lagopus_client.show_channels()
+        names = [d['name'] for d in data]
+        if channel not in names:
+            self.lagopus_client.create_channel(channel)
+
+    def _create_controller(self, controller, channel):
+        data = self.lagopus_client.show_controllers()
+        names = [d['name'] for d in data]
+        if controller not in names:
+            self.lagopus_client.create_controller(controller, channel)
+
+    def _create_bridge(self, brname, controller, dpid):
+        data = self.lagopus_client.show_bridges()
+        names = [d['name'] for d in data]
+        if brname not in names:
+            self.lagopus_client.create_bridge(brname, controller, dpid)
+
     def get_bridge(self, segment):
         vlan_id = (segment['segmentation_id']
                    if segment['network_type'] == p_constants.TYPE_VLAN
@@ -304,15 +326,14 @@ class LagopusManager(object):
 
         # bridge for vlan physical_network does not exist.
         # so create the bridge.
-        bridge_id = len(self.bridges) + 1
-        channel = "channel%d" % bridge_id
-        self.lagopus_client.create_channel(channel)
-        controller = "controller%d" % bridge_id
-        self.lagopus_client.create_controller(controller, channel)
-        name = "%s_%d" % (phys_net, vlan_id)
-        self.lagopus_client.create_bridge(name, controller, dpid)
+        brname = "%s_%d" % (phys_net, vlan_id)
+        channel = "ch-%s" % brname
+        self._create_channel(channel)
+        controller = "con-%s" % brname
+        self._create_controller(controller, channel)
+        self._create_bridge(brname, controller, dpid)
 
-        bridge = LagopusBridge(self.ryu_app, name, dpid, None, False)
+        bridge = LagopusBridge(self.ryu_app, brname, dpid, None)
         self.bridges[dpid] = bridge
 
         pipe1, pipe2 = self.get_pipe()
@@ -436,7 +457,8 @@ class LagopusAgent(service.Service):
     def _report_state(self):
         try:
             devices = len(self.manager.get_all_devices())
-            self.agent_state.get('configurations')['devices'] = devices
+            self.agent_state['configurations']['devices'] = devices
+            self.state_rpc.report_state(self.context, self.agent_state, True)
             # we only want to update resource versions on startup
             self.agent_state.pop('resource_versions', None)
             self.agent_state.pop('start_flag', None)
