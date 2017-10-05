@@ -47,6 +47,14 @@ class LagopusCommand(object):
         cmd = "bridge\n"
         return self._lagosh(cmd)
 
+    def show_channels(self):
+        cmd = "channel\n"
+        return self._lagosh(cmd)
+
+    def show_controllers(self):
+        cmd = "controller\n"
+        return self._lagosh(cmd)
+
     @log_helpers.log_method_call
     def create_channel(self, name):
         cmd = "channel %s create -dst-addr 127.0.0.1 -protocol tcp\n" % name
