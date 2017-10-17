@@ -24,6 +24,7 @@ from oslo_service import service
 from osprofiler import profiler
 from ryu.app.ofctl import api as ofctl_api
 
+from neutron.agent.linux import ip_lib
 from neutron.agent import rpc as agent_rpc
 from neutron.api.rpc.callbacks import resources
 from neutron.common import config as common_config
@@ -43,36 +44,52 @@ AGENT_TYPE_LAGOPUS = 'Lagopus agent'
 MAX_WAIT_LAGOPUS_RETRY = 5
 OFPP_MAX = 0xffffff00
 
+INTERFACE_TYPE_VHOST = "vhost"
+INTERFACE_TYPE_PIPE = "pipe"
+
+
+class LagopusInterface(object):
+
+    def __init__(self, name, device):
+        self.name = name
+        self.type = None
+        self.id = None
+        self._get_type_and_id(device)
+
+    def _get_type_and_id(self, device):
+        if device.startswith("eth_vhost"):
+            self.type = INTERFACE_TYPE_VHOST
+            self.id = int(device.split(',')[0][len("eth_vhost"):])
+        elif device.startswith("eth_pipe"):
+            self.type = INTERFACE_TYPE_PIPE
+            self.id = int(device.split(',')[0][len("eth_pipe"):])
+
+
+class LagopusPort(object):
+
+    def __init__(self, name, interface):
+        self.name = name
+        self.interface = interface
+        self.bridge = None
+
 
 class LagopusBridge(object):
 
-    def __init__(self, ryu_app, name, dpid, port_data):
+    def __init__(self, ryu_app, name, dpid):
         LOG.debug("LagopusBridge: %s %s", name, dpid)
         self.ryu_app = ryu_app
         self.name = name
-        self.lagopus_client = lagopus_lib.LagopusCommand()
 
-        self.used_ofport = []
         self.max_ofport = 0
-        self.port_mappings = {}
-
-        if port_data:
-            for port, ofport in port_data.items():
-                # remove ':'
-                port_name = port[1:]
-                self.port_mappings[port_name] = ofport
-                self.used_ofport.append(ofport)
-            if self.used_ofport:
-                self.max_ofport = max(self.used_ofport)
-
-        LOG.debug("used_ofport: %s, max_ofport: %d",
-                  self.used_ofport, self.max_ofport)
+        self.used_ofport = []
+        self.pipe_ids = []
+        self.installed_vlan = []
 
         self.dpid = dpid
         self.datapath = self._get_datapath()
         self.install_normal()
-        # just for debug
-        self.dump_flows()
+
+        self.dump_flows()  # just for debug
         return
 
     def _get_datapath(self):
@@ -102,8 +119,10 @@ class LagopusBridge(object):
         # TODO(hichihara): error handling
         ofctl_api.send_msg(self.ryu_app, msg)
 
-    def install_vlan(self, vlan_id, port_name):
-        ofport = self.port_mappings[port_name]
+    def install_vlan(self, vlan_id, port):
+        if vlan_id in self.installed_vlan:
+            return
+        ofport = port.ofport
         ofp = self.datapath.ofproto
         ofpp = self.datapath.ofproto_parser
 
@@ -138,6 +157,8 @@ class LagopusBridge(object):
         # TODO(hichihara): error handling
         ofctl_api.send_msg(self.ryu_app, msg)
 
+        self.installed_vlan.append(vlan_id)
+
     def dump_flows(self):
         ofpp = self.datapath.ofproto_parser
         msg = ofpp.OFPFlowStatsRequest(self.datapath)
@@ -147,29 +168,28 @@ class LagopusBridge(object):
                                     reply_multi=True)
         LOG.debug("%s flows: %s", self.name, result)
 
-    def get_ofport(self):
+    def _get_ofport(self):
         if self.max_ofport < OFPP_MAX:
-            self.max_ofport += 1
-            self.used_ofport.append(self.max_ofport)
-            return self.max_ofport
-        for num in range(1, OFPP_MAX + 1):
-            if num not in self.used_ofport:
-                self.used_ofport.append(num)
-                return num
+            return self.max_ofport + 1
+        else:
+            for ofport in range(1, OFPP_MAX + 1):
+                if ofport not in self.used_ofport:
+                    return ofport
 
-    def free_ofport(self, ofport):
-        if ofport in self.used_ofport:
-            self.used_ofport.remove(ofport)
+    def _add_port(self, port, ofport):
+        self.used_ofport.append(ofport)
+        self.max_ofport = max(self.max_ofport, ofport)
+        port.ofport = ofport
+        port.bridge = self
+        if port.interface.type == INTERFACE_TYPE_PIPE:
+            self.pipe_ids.append(port.interface.id)
 
-    def add_port(self, port_name):
-        b, p = self.lagopus_client.find_bridge_port(port_name, self.name)
-        if b is not None:
-            LOG.debug("port %s is already pluged.", port_name)
-            return
+    def add_port(self, port):
+        self._add_port(port, self._get_ofport())
 
-        ofport = self.get_ofport()
-        self.port_mappings[port_name] = ofport
-        self.lagopus_client.bridge_add_port(self.name, port_name, ofport)
+    def del_port(self, port):
+        self.used_ofport.remove(port.ofport)
+        port.bridge = None
 
 
 @profiler.trace_cls("rpc")
@@ -179,240 +199,300 @@ class LagopusManager(object):
         self.lagopus_client = lagopus_lib.LagopusCommand()
         self.bridge_mappings = bridge_mappings
         self.ryu_app = ryu_app
+        self.serializer = eventlet.semaphore.Semaphore()
 
-        raw_bridges = self._get_init_bridges()
+        self._wait_lagopus_initialized()
 
+        # initialize device caches
+        # channel cache stores name only
+        raw_data = self.lagopus_client.show_channels()
+        LOG.debug("channels: %s", raw_data)
+        self.channels = [item["name"] for item in raw_data]
+
+        # controller cache stores name only
+        raw_data = self.lagopus_client.show_controllers()
+        LOG.debug("controllers: %s", raw_data)
+        self.controllers = [item["name"] for item in raw_data]
+
+        # interface cache
+        raw_data = self.lagopus_client.show_interfaces()
+        LOG.debug("interfaces: %s", raw_data)
+        self.interfaces = {}
+        self.num_vhost = 0
+        self.num_pipe = 0
+        for item in raw_data:
+            i_name = item["name"]
+            interface = LagopusInterface(i_name, item["device"])
+            self.interfaces[i_name] = interface
+            if interface.type == INTERFACE_TYPE_VHOST:
+                self.num_vhost += 1
+            elif interface.type == INTERFACE_TYPE_PIPE:
+                self.num_pipe += 1
+
+        # port cache
+        raw_data = self.lagopus_client.show_ports()
+        LOG.debug("ports: %s", raw_data)
+        self.ports = {}
+        self.used_vhost_id = []
+        for item in raw_data:
+            interface = self.interfaces[item["interface"]]
+            p_name = item["name"]
+            self.ports[p_name] = LagopusPort(p_name, interface)
+            if interface.type == INTERFACE_TYPE_VHOST:
+                self.used_vhost_id.append(interface.id)
+
+        # bridge cache
         self.bridges = {}
-        name_to_dpid = {}
-        bridge_names = bridge_mappings.values()
-        for raw_bridge in raw_bridges:
-            name = raw_bridge["name"]
-            dpid = raw_bridge["dpid"]
-            ports = raw_bridge["ports"]
-            self.bridges[dpid] = LagopusBridge(ryu_app, name, dpid, ports)
-            if name in bridge_names:
-                name_to_dpid[name] = dpid
+        raw_data = self.lagopus_client.show_bridges()
+        LOG.debug("bridges: %s", raw_data)
+        for item in raw_data:
+            b_name = item["name"]
+            bridge = LagopusBridge(ryu_app, b_name, item["dpid"])
+            self.bridges[b_name] = bridge
+            for p_name, ofport in item["ports"].items():
+                port = self.ports[p_name[1:]]  # remove ":"
+                bridge._add_port(port, ofport)
 
-        self.phys_to_dpid = {}
+        self.phys_to_bridge = {}
         for phys_net, name in bridge_mappings.items():
-            if name not in name_to_dpid:
+            if name not in self.bridges:
                 LOG.error("Bridge %s not found.", name)
                 sys.exit(1)
-            self.phys_to_dpid[phys_net] = name_to_dpid[name]
-        LOG.debug("phys_to_dpid: %s", self.phys_to_dpid)
+            self.phys_to_bridge[phys_net] = self.bridges[name]
 
-        interfaces = self.lagopus_client.show_interfaces()
-        ports = self.lagopus_client.show_ports()
-        LOG.debug("interfaces: %s", interfaces)
-        LOG.debug("ports: %s", ports)
-
-        # init vhost
-        vhost_interfaces = [inter for inter in interfaces
-                            if inter["device"].startswith("eth_vhost")]
-        self.num_vhost = len(vhost_interfaces)
-        used_interfaces = [p["interface"] for p in ports]
-        self.used_vhost_id = []
-        for inter in vhost_interfaces:
-            if inter["name"] in used_interfaces:
-                vhost_dev = inter['device'].split(',')[0]
-                vhost_id = int(vhost_dev[len("eth_vhost"):])
-                self.used_vhost_id.append(vhost_id)
         LOG.debug("num_vhost: %d, used_vhost_id: %s", self.num_vhost,
                   self.used_vhost_id)
 
-        # init pipe
-        pipe_interfaces = [inter for inter in interfaces
-                           if inter["device"].startswith("eth_pipe")]
-        self.num_pipe = len(pipe_interfaces)
-        # TODO(hichihara) pipe interface does not remove now.
-
-    def _get_init_bridges(self):
+    def _wait_lagopus_initialized(self):
         for retry in range(MAX_WAIT_LAGOPUS_RETRY):
-            raw_bridges = self.lagopus_client.show_bridges()
-            if raw_bridges:
-                LOG.debug("bridges: %s", raw_bridges)
-                return raw_bridges
+            data = self.lagopus_client.show_channels()
+            if data:
+                return
             LOG.debug("Lagopus may not be initialized. waiting")
             eventlet.sleep(10)
         LOG.error("Lagopus isn't running")
         sys.exit(1)
 
-    def get_vhost_interface(self):
-        if self.num_vhost == len(self.used_vhost_id):
-            # create new vhost interface
-            vhost_id = self.num_vhost
-            sock_path = "/tmp/sock%d" % vhost_id
-            device = "eth_vhost%d,iface=%s" % (vhost_id, sock_path)
-            name = "vhost_%d" % vhost_id
-            self.lagopus_client.create_vhost_interface(name, device)
-            self.num_vhost += 1
-            LOG.debug("vhost %d added.", vhost_id)
-            os.system("sudo chmod 777 %s" % sock_path)
+    def _channel_name(self, b_name):
+        return "ch-%s" % b_name
+
+    def _controller_name(self, b_name):
+        return "con-%s" % b_name
+
+    def _sock_path(self, vhost_id):
+        return "/tmp/sock%d" % vhost_id
+
+    def _vhost_interface_name(self, vhost_id):
+        return "vhost_%d" % vhost_id
+
+    def _rawsock_interface_name(self, device):
+        return 'i' + device
+
+    def _rawsock_port_name(self, device):
+        return 'p' + device
+
+    def _vlan_bridge_name(self, phys_net, vlan_id):
+        return "%s_%d" % (phys_net, vlan_id)
+
+    def _pipe_interface_name(self, pipe_id):
+        return "pipe-%d" % pipe_id, "pipe-%d" % (pipe_id + 1)
+
+    def _pipe_device(self, pipe_id):
+        device1 = "eth_pipe%d" % pipe_id
+        device2 = "eth_pipe%d,attach=%s" % (pipe_id + 1, device1)
+        return device1, device2
+
+    def _pipe_port_name(self, pipe_id):
+        i_name1, i_name2 = self._pipe_interface_name(pipe_id)
+        return "p-%s" % i_name1, "p-%s" % i_name2
+
+    def _create_channel(self, name):
+        if name not in self.channels:
+            self.lagopus_client.create_channel(name)
+            self.channels.append(name)
+
+    def _create_controller(self, name, channel):
+        if name not in self.controllers:
+            self.lagopus_client.create_controller(name, channel)
+            self.controllers.append(name)
+
+    def _create_bridge(self, b_name, controller, dpid):
+        if b_name not in self.bridges:
+            self.lagopus_client.create_bridge(b_name, controller, dpid)
+            self.bridges[b_name] = LagopusBridge(self.ryu_app, b_name, dpid)
+
+    def _create_interface(self, i_name, dev_type, device):
+        if i_name not in self.interfaces:
+            self.lagopus_client.create_interface(i_name, dev_type, device)
+            self.interfaces[i_name] = LagopusInterface(i_name, device)
+
+    def _destroy_interface(self, i_name):
+        if i_name in self.interfaces:
+            self.lagopus_client.destroy_interface(i_name)
+            del self.interfaces[i_name]
+
+    def _create_port(self, p_name, i_name):
+        if p_name not in self.ports:
+            self.lagopus_client.create_port(p_name, i_name)
+            self.ports[p_name] = LagopusPort(p_name, self.interfaces[i_name])
+
+    def _destroy_port(self, p_name):
+        if p_name in self.ports:
+            self.lagopus_client.destroy_port(p_name)
+            del self.ports[p_name]
+
+    def create_pipe_ports(self, bridge):
+        if bridge.pipe_ids:
+            pipe_id = bridge.pipe_ids[0]
         else:
-            for vhost_id in range(self.num_vhost):
-                if vhost_id not in self.used_vhost_id:
-                    sock_path = "/tmp/sock%d" % vhost_id
-                    name = "vhost_%d" % vhost_id
-                    break
-        self.used_vhost_id.append(vhost_id)
-        return name, sock_path
+            pipe_id = self.num_pipe
+            self.num_pipe += 2
 
-    def free_vhost_id(self, vhost_id):
-        if vhost_id in self.used_vhost_id:
-            self.used_vhost_id.remove(vhost_id)
+        i_name1, i_name2 = self._pipe_interface_name(pipe_id)
+        device1, device2 = self._pipe_device(pipe_id)
+        self._create_interface(i_name1, "ethernet-dpdk-phy", device1)
+        self._create_interface(i_name2, "ethernet-dpdk-phy", device2)
 
-    def port_to_vhost_id(self, port_id):
-        ports = self.lagopus_client.show_ports()
-        for port in ports:
-            if port["name"] == port_id:
-                interface = port["interface"]
-                if interface.startswith("vhost_"):
-                    vhost_id = int(interface[len("vhost_"):])
-                    return vhost_id
-                return
+        p_name1, p_name2 = self._pipe_port_name(pipe_id)
+        self._create_port(p_name1, i_name1)
+        self._create_port(p_name2, i_name2)
 
-    def get_pipe(self):
-        name0 = "pipe-%d" % self.num_pipe
-        name1 = "pipe-%d" % (self.num_pipe + 1)
-        device0 = "eth_pipe%d" % self.num_pipe
-        device1 = "eth_pipe%d,attach=%s" % (self.num_pipe + 1, device0)
-        self.num_pipe += 2
+        return self.ports[p_name1], self.ports[p_name2]
 
-        self.lagopus_client.create_pipe_interface(name0, device0)
-        self.lagopus_client.create_pipe_interface(name1, device1)
+    def create_bridge(self, b_name, dpid):
+        channel = self._channel_name(b_name)
+        self._create_channel(channel)
+        controller = self._controller_name(b_name)
+        self._create_controller(controller, channel)
+        self._create_bridge(b_name, controller, dpid)
+        return self.bridges[b_name]
 
-        return name0, name1
+    def bridge_add_port(self, bridge, port):
+        if port.bridge is None:
+            bridge.add_port(port)
+            self.lagopus_client.bridge_add_port(bridge.name, port.name,
+                                                port.ofport)
 
-    def get_all_devices(self):
-        devices = set()
-        ports = self.lagopus_client.show_ports()
-        for port in ports:
-            devices.add(port["name"])
-        LOG.debug("get_all_devices: %s", devices)
-        return devices
-
-    def _create_channel(self, channel):
-        data = self.lagopus_client.show_channels()
-        names = [d['name'] for d in data]
-        if channel not in names:
-            self.lagopus_client.create_channel(channel)
-
-    def _create_controller(self, controller, channel):
-        data = self.lagopus_client.show_controllers()
-        names = [d['name'] for d in data]
-        if controller not in names:
-            self.lagopus_client.create_controller(controller, channel)
-
-    def _create_bridge(self, brname, controller, dpid):
-        data = self.lagopus_client.show_bridges()
-        names = [d['name'] for d in data]
-        if brname not in names:
-            self.lagopus_client.create_bridge(brname, controller, dpid)
+    def bridge_del_port(self, port):
+        if port and port.bridge:
+            bridge = port.bridge
+            self.lagopus_client.bridge_del_port(bridge.name, port.name)
+            bridge.del_port(port)
 
     def get_bridge(self, segment):
-        vlan_id = (segment['segmentation_id']
-                   if segment['network_type'] == p_constants.TYPE_VLAN
-                   else 0)
         phys_net = segment['physical_network']
-        if phys_net not in self.phys_to_dpid:
-            # Error
-            return
-        dpid = (vlan_id << 48) | self.phys_to_dpid[phys_net]
-        LOG.debug("vlan_id %d phys dpid %d", vlan_id,
-                  self.phys_to_dpid[phys_net])
-        LOG.debug("dpid %d 0x%x", dpid, dpid)
-        if dpid in self.bridges:
-            return self.bridges[dpid]
+        phys_bridge = self.phys_to_bridge.get(phys_net)
+        if phys_bridge is None:
+            # basically this can't be happen since neutron-server
+            # already checked before issuing RPC.
+            raise ValueError("%s is not configured." % phys_net)
 
-        # bridge for vlan physical_network does not exist.
-        # so create the bridge.
-        brname = "%s_%d" % (phys_net, vlan_id)
-        channel = "ch-%s" % brname
-        self._create_channel(channel)
-        controller = "con-%s" % brname
-        self._create_controller(controller, channel)
-        self._create_bridge(brname, controller, dpid)
+        if (segment['network_type'] == p_constants.TYPE_FLAT):
+            return phys_bridge
 
-        bridge = LagopusBridge(self.ryu_app, brname, dpid, None)
-        self.bridges[dpid] = bridge
+        vlan_id = segment['segmentation_id']
+        b_name = self._vlan_bridge_name(phys_net, vlan_id)
+        bridge = self.bridges.get(b_name)
+        if bridge is None:
+            # vlan bridge does not exeist. so create the bridge
+            dpid = (vlan_id << 48) | phys_bridge.dpid
+            bridge = self.create_bridge(b_name, dpid)
 
-        pipe1, pipe2 = self.get_pipe()
-        port1 = "p-%s" % pipe1
-        port2 = "p-%s" % pipe2
-        self.lagopus_client.create_port(port1, pipe1)
-        self.lagopus_client.create_port(port2, pipe2)
-
-        phys_bridge = self.bridges[self.phys_to_dpid[phys_net]]
-        bridge.add_port(port1)
-        phys_bridge.add_port(port2)
+        # make sure there is pipe connection between phys_bridge
+        port1, port2 = self.create_pipe_ports(bridge)
+        self.bridge_add_port(bridge, port1)
+        self.bridge_add_port(phys_bridge, port2)
 
         phys_bridge.install_vlan(vlan_id, port2)
 
         return bridge
 
+    def create_vhost_interface(self, vhost_id):
+        sock_path = self._sock_path(vhost_id)
+        device = "eth_vhost%d,iface=%s" % (vhost_id, sock_path)
+        i_name = self._vhost_interface_name(vhost_id)
+        self._create_interface(i_name, "ethernet-dpdk-phy", device)
+        LOG.debug("vhost %d added.", vhost_id)
+        os.system("sudo chmod 777 %s" % sock_path)
+
+    def get_vhost_id(self):
+        if self.num_vhost == len(self.used_vhost_id):
+            # create new vhost interface
+            vhost_id = self.num_vhost
+            self.create_vhost_interface(vhost_id)
+            self.num_vhost += 1
+        else:
+            for vhost_id in range(self.num_vhost):
+                if vhost_id not in self.used_vhost_id:
+                    break
+        self.used_vhost_id.append(vhost_id)
+        return vhost_id
+
+    def create_vhost_port(self, p_name):
+        if p_name not in self.ports:
+            vhost_id = self.get_vhost_id()
+            i_name = self._vhost_interface_name(vhost_id)
+            self._create_port(p_name, i_name)
+        return self.ports[p_name]
+
+    def destroy_vhost_port(self, port):
+        if port:
+            vhost_id = port.interface.id
+            self._destroy_port(port.name)
+            self.used_vhost_id.remove(vhost_id)
+
+    def create_rawsock_port(self, device):
+        i_name = self._rawsock_interface_name(device)
+        p_name = self._rawsock_port_name(device)
+
+        self._create_interface(i_name, "ethernet-rawsock", device)
+        self._create_port(p_name, i_name)
+        return self.ports[p_name]
+
     @log_helpers.log_method_call
     def plug_vhost(self, context, **kwargs):
-        port_id = kwargs['port_id']
+        # port name == port_id for vhostuser
+        p_name = kwargs['port_id']
         segment = kwargs['segment']
 
-        bridge = self.get_bridge(segment)
-        if not bridge:
-            # raise
-            return
+        with self.serializer:
+            port = self.create_vhost_port(p_name)
+            bridge = self.get_bridge(segment)
+            self.bridge_add_port(bridge, port)
 
-        interface_name, sock_path = self.get_vhost_interface()
-        self.lagopus_client.create_port(port_id, interface_name)
-        bridge.add_port(port_id)
-        return sock_path
+            return self._sock_path(port.interface.id)
 
     @log_helpers.log_method_call
     def unplug_vhost(self, context, **kwargs):
-        port_id = kwargs['port_id']
-        bridge_name, _ = self.lagopus_client.find_bridge_port(port_id)
-        if not bridge_name:
-            LOG.debug("port %s is already unpluged.", port_id)
-            return
-        self.lagopus_client.bridge_del_port(bridge_name, port_id)
-        vhost_id = self.port_to_vhost_id(port_id)
-        self.lagopus_client.destroy_port(port_id)
-        if vhost_id:
-            self.free_vhost_id(vhost_id)
+        p_name = kwargs['port_id']
+
+        with self.serializer:
+            port = self.ports.get(p_name)
+            self.bridge_del_port(port)
+            self.destroy_vhost_port(port)
 
     @log_helpers.log_method_call
     def plug_rawsock(self, context, **kwargs):
         device = kwargs['device']
         segment = kwargs['segment']
 
-        if segment is None:
-            LOG.debug("no segment. port may not exist.")
-            return
-
-        bridge = self.get_bridge(segment)
-        if not bridge:
-            return
-
-        interface_name = 'i' + device
-        port_name = 'p' + device
-        self.lagopus_client.create_rawsock_interface(interface_name, device)
-        self.lagopus_client.create_port(port_name, interface_name)
-        bridge.add_port(port_name)
-
-        return True
+        with self.serializer:
+            if not ip_lib.device_exists(device):
+                raise RuntimeError("interface %s does not exist.", device)
+            port = self.create_rawsock_port(device)
+            bridge = self.get_bridge(segment)
+            self.bridge_add_port(bridge, port)
 
     @log_helpers.log_method_call
     def unplug_rawsock(self, context, **kwargs):
         device = kwargs['device']
-        interface_name = 'i' + device
-        port_name = 'p' + device
+        i_name = self._rawsock_interface_name(device)
+        p_name = self._rawsock_port_name(device)
 
-        bridge_name, _ = self.lagopus_client.find_bridge_port(port_name)
-        if not bridge_name:
-            LOG.debug("device %s is already unpluged.", device)
-            return
-
-        self.lagopus_client.bridge_del_port(bridge_name, port_name)
-        self.lagopus_client.destroy_port(port_name)
-        self.lagopus_client.destroy_interface(interface_name)
+        with self.serializer:
+            self.bridge_del_port(self.ports.get(p_name))
+            self._destroy_port(p_name)
+            self._destroy_interface(i_name)
 
 
 class LagopusAgent(service.Service):
@@ -456,7 +536,7 @@ class LagopusAgent(service.Service):
 
     def _report_state(self):
         try:
-            devices = len(self.manager.get_all_devices())
+            devices = len(self.manager.ports)
             self.agent_state['configurations']['devices'] = devices
             self.state_rpc.report_state(self.context, self.agent_state, True)
             # we only want to update resource versions on startup

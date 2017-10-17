@@ -54,5 +54,6 @@ class LagopusAgentApi(object):
 
     def unplug_vhost(self, context, port_id, host=None):
         cctxt = self._get_context(host)
-        return cctxt.call(context, 'unplug_vhost',
+        # asynchronous
+        return cctxt.cast(context, 'unplug_vhost',
                           port_id=port_id)
