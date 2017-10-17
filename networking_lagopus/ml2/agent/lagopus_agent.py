@@ -10,6 +10,8 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
+import collections
+import contextlib
 import eventlet
 import os
 import sys
@@ -24,6 +26,7 @@ from oslo_service import service
 from osprofiler import profiler
 from ryu.app.ofctl import api as ofctl_api
 
+from neutron.agent.linux import ip_lib
 from neutron.agent import rpc as agent_rpc
 from neutron.api.rpc.callbacks import resources
 from neutron.common import config as common_config
@@ -172,6 +175,41 @@ class LagopusBridge(object):
         self.lagopus_client.bridge_add_port(self.name, port_name, ofport)
 
 
+class PlugSerializer(object):
+    """Serializer for plug/unplug.
+
+    This class is used to serialize plug/unplug operation for
+    same neutron port.
+
+    Note: port_id is neutron port id for vhostuser,
+    device name (tap name) for rawsock.
+    """
+
+    def __init__(self):
+        self.port_sems = {}
+        self.lock_ports = collections.defaultdict(int)
+        self.dict_lock = eventlet.semaphore.Semaphore()
+
+    @contextlib.contextmanager
+    def lock(self, port_id):
+        with self.dict_lock:
+            self.lock_ports[port_id] += 1
+            if self.lock_ports[port_id] == 1:
+                sem = eventlet.semaphore.Semaphore()
+                self.port_sems[port_id] = sem
+            else:
+                sem = self.port_sems[port_id]
+        try:
+            with sem:
+                yield
+        finally:
+            with self.dict_lock:
+                self.lock_ports[port_id] -= 1
+                if self.lock_ports[port_id] == 0:
+                    del self.port_sems[port_id]
+                    del self.lock_ports[port_id]
+
+
 @profiler.trace_cls("rpc")
 class LagopusManager(object):
 
@@ -179,6 +217,7 @@ class LagopusManager(object):
         self.lagopus_client = lagopus_lib.LagopusCommand()
         self.bridge_mappings = bridge_mappings
         self.ryu_app = ryu_app
+        self.serializer = PlugSerializer()
 
         raw_bridges = self._get_init_bridges()
 
@@ -237,13 +276,25 @@ class LagopusManager(object):
         LOG.error("Lagopus isn't running")
         sys.exit(1)
 
+    def _sock_path(self, vhost_id):
+        return "/tmp/sock%d" % vhost_id
+
+    def _vhost_interface_name(self, vhost_id):
+        return "vhost_%d" % vhost_id
+
+    def _rawsock_interface_name(self, device):
+        return 'i' + device
+
+    def _rawsock_port_name(self, device):
+        return 'p' + device
+
     def get_vhost_interface(self):
         if self.num_vhost == len(self.used_vhost_id):
             # create new vhost interface
             vhost_id = self.num_vhost
-            sock_path = "/tmp/sock%d" % vhost_id
+            sock_path = self._sock_path(vhost_id)
             device = "eth_vhost%d,iface=%s" % (vhost_id, sock_path)
-            name = "vhost_%d" % vhost_id
+            name = self._vhost_interface_name(vhost_id)
             self.lagopus_client.create_vhost_interface(name, device)
             self.num_vhost += 1
             LOG.debug("vhost %d added.", vhost_id)
@@ -251,8 +302,8 @@ class LagopusManager(object):
         else:
             for vhost_id in range(self.num_vhost):
                 if vhost_id not in self.used_vhost_id:
-                    sock_path = "/tmp/sock%d" % vhost_id
-                    name = "vhost_%d" % vhost_id
+                    sock_path = self._sock_path(vhost_id)
+                    name = self._vhost_interface_name(vhost_id)
                     break
         self.used_vhost_id.append(vhost_id)
         return name, sock_path
@@ -309,18 +360,41 @@ class LagopusManager(object):
         if brname not in names:
             self.lagopus_client.create_bridge(brname, controller, dpid)
 
+    def _create_rawsock_interface(self, interface_name, device):
+        data = self.lagopus_client.show_interfaces()
+        names = [d['name'] for d in data]
+        if interface_name not in names:
+            self.lagopus_client.create_rawsock_interface(interface_name,
+                                                         device)
+
+    def _destroy_interface(self, interface_name):
+        data = self.lagopus_client.show_interfaces()
+        names = [d['name'] for d in data]
+        if interface_name in names:
+            self.lagopus_client.destroy_interface(interface_name)
+
+    def _create_port(self, port_name, interface_name):
+        data = self.lagopus_client.show_ports()
+        names = [d['name'] for d in data]
+        if port_name not in names:
+            self.lagopus_client.create_port(port_name, interface_name)
+
+    def _destroy_port(self, port_name):
+        data = self.lagopus_client.show_ports()
+        names = [d['name'] for d in data]
+        if port_name in names:
+            self.lagopus_client.destroy_port(port_name)
+
     def get_bridge(self, segment):
         vlan_id = (segment['segmentation_id']
                    if segment['network_type'] == p_constants.TYPE_VLAN
                    else 0)
         phys_net = segment['physical_network']
         if phys_net not in self.phys_to_dpid:
-            # Error
-            return
+            # basically this can't be happen since neutron-server
+            # already checked before issuing RPC.
+            raise ValueError("%s is not configured." % phys_net)
         dpid = (vlan_id << 48) | self.phys_to_dpid[phys_net]
-        LOG.debug("vlan_id %d phys dpid %d", vlan_id,
-                  self.phys_to_dpid[phys_net])
-        LOG.debug("dpid %d 0x%x", dpid, dpid)
         if dpid in self.bridges:
             return self.bridges[dpid]
 
@@ -355,64 +429,78 @@ class LagopusManager(object):
         port_id = kwargs['port_id']
         segment = kwargs['segment']
 
-        bridge = self.get_bridge(segment)
-        if not bridge:
-            # raise
-            return
+        with self.serializer.lock(port_id):
+            bridge_name, _ = self.lagopus_client.find_bridge_port(port_id)
+            if bridge_name:
+                LOG.debug("port %s is already pluged.", port_id)
+                vhost_id = self.port_to_vhost_id(port_id)
+                return self._sock_path(vhost_id)
 
-        interface_name, sock_path = self.get_vhost_interface()
-        self.lagopus_client.create_port(port_id, interface_name)
-        bridge.add_port(port_id)
-        return sock_path
+            vhost_id = self.port_to_vhost_id(port_id)
+            if vhost_id is not None:
+                # port with vhost interface already exists.
+                sock_path = self._sock_path(vhost_id)
+            else:
+                interface_name, sock_path = self.get_vhost_interface()
+                # make sure port does not exists.
+                self._destroy_port(port_id)
+                self.lagopus_client.create_port(port_id, interface_name)
+
+            bridge = self.get_bridge(segment)
+            bridge.add_port(port_id)
+
+            return sock_path
 
     @log_helpers.log_method_call
     def unplug_vhost(self, context, **kwargs):
         port_id = kwargs['port_id']
-        bridge_name, _ = self.lagopus_client.find_bridge_port(port_id)
-        if not bridge_name:
-            LOG.debug("port %s is already unpluged.", port_id)
-            return
-        self.lagopus_client.bridge_del_port(bridge_name, port_id)
-        vhost_id = self.port_to_vhost_id(port_id)
-        self.lagopus_client.destroy_port(port_id)
-        if vhost_id:
-            self.free_vhost_id(vhost_id)
+
+        with self.serializer.lock(port_id):
+            bridge_name, _ = self.lagopus_client.find_bridge_port(port_id)
+            if not bridge_name:
+                LOG.debug("port %s is already unpluged.", port_id)
+            else:
+                self.lagopus_client.bridge_del_port(bridge_name, port_id)
+            vhost_id = self.port_to_vhost_id(port_id)
+            self._destroy_port(port_id)
+            if vhost_id is not None:
+                self.free_vhost_id(vhost_id)
 
     @log_helpers.log_method_call
     def plug_rawsock(self, context, **kwargs):
         device = kwargs['device']
         segment = kwargs['segment']
+        interface_name = self._rawsock_interface_name(device)
+        port_name = self._rawsock_port_name(device)
 
-        if segment is None:
-            LOG.debug("no segment. port may not exist.")
-            return
+        with self.serializer.lock(device):
+            if not ip_lib.device_exists(device):
+                raise RuntimeError("interface %s does not exist.", device)
 
-        bridge = self.get_bridge(segment)
-        if not bridge:
-            return
+            bridge_name, _ = self.lagopus_client.find_bridge_port(port_name)
+            if bridge_name:
+                LOG.debug("port %s is already pluged.", port_name)
+                return
 
-        interface_name = 'i' + device
-        port_name = 'p' + device
-        self.lagopus_client.create_rawsock_interface(interface_name, device)
-        self.lagopus_client.create_port(port_name, interface_name)
-        bridge.add_port(port_name)
-
-        return True
+            self._create_rawsock_interface(interface_name, device)
+            self._create_port(port_name, interface_name)
+            bridge = self.get_bridge(segment)
+            bridge.add_port(port_name)
 
     @log_helpers.log_method_call
     def unplug_rawsock(self, context, **kwargs):
         device = kwargs['device']
-        interface_name = 'i' + device
-        port_name = 'p' + device
+        interface_name = self._rawsock_interface_name(device)
+        port_name = self._rawsock_port_name(device)
 
-        bridge_name, _ = self.lagopus_client.find_bridge_port(port_name)
-        if not bridge_name:
-            LOG.debug("device %s is already unpluged.", device)
-            return
-
-        self.lagopus_client.bridge_del_port(bridge_name, port_name)
-        self.lagopus_client.destroy_port(port_name)
-        self.lagopus_client.destroy_interface(interface_name)
+        with self.serializer.lock(device):
+            bridge_name, _ = self.lagopus_client.find_bridge_port(port_name)
+            if not bridge_name:
+                LOG.debug("device %s is already unpluged.", device)
+            else:
+                self.lagopus_client.bridge_del_port(bridge_name, port_name)
+            self._destroy_port(port_name)
+            self._destroy_interface(interface_name)
 
 
 class LagopusAgent(service.Service):
