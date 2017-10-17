@@ -46,10 +46,21 @@ class LagopusInterfaceDriver(n_interface.LinuxInterfaceDriver):
                     'network_type': details['network_type'],
                     'segmentation_id': details['segmentation_id']}
 
+        raise RuntimeError("Failed to get segment for port %s" % port_id)
+
     def _disable_tcp_offload(self, namespace, device_name):
         ip_wrapper = ip_lib.IPWrapper(namespace)
         cmd = ['ethtool', '-K', device_name, 'tx', 'off', 'tso', 'off']
         ip_wrapper.netns.execute(cmd)
+
+    def plug(self, network_id, port_id, device_name, mac_address,
+             bridge=None, namespace=None, prefix=None, mtu=None):
+        # override this method because there are some tasks to be done
+        # regardless of whether the interface exists.
+        # note that plug_new must be implemented because it is
+        # an abstractmethod.
+        self.plug_new(network_id, port_id, device_name, mac_address,
+                      bridge, namespace, prefix, mtu)
 
     def plug_new(self, network_id, port_id, device_name, mac_address,
                  bridge=None, namespace=None, prefix=None, mtu=None):
@@ -57,8 +68,13 @@ class LagopusInterfaceDriver(n_interface.LinuxInterfaceDriver):
         ip = ip_lib.IPWrapper()
         tap_name = device_name.replace(prefix or self.DEV_NAME_PREFIX,
                                        n_const.TAP_DEVICE_PREFIX)
-        root_veth, ns_veth = ip.add_veth(tap_name, device_name,
-                                         namespace2=namespace)
+        if ip_lib.device_exists(device_name, namespace=namespace):
+            LOG.info("Device %s already exists", device_name)
+            root_veth, ns_veth = n_interface._get_veth(tap_name, device_name,
+                                                       namespace)
+        else:
+            root_veth, ns_veth = ip.add_veth(tap_name, device_name,
+                                             namespace2=namespace)
         root_veth.disable_ipv6()
         ns_veth.link.set_address(mac_address)
 
@@ -72,12 +88,14 @@ class LagopusInterfaceDriver(n_interface.LinuxInterfaceDriver):
         ns_veth.link.set_up()
         self._disable_tcp_offload(namespace, device_name)
 
-        # do first and error check
         segment = self._get_network_segment(port_id)
-
         self.lagopus_api.plug_rawsock(self.context, tap_name, segment)
-        self.plugin_api.update_device_up(self.context, port_id,
-                                         self.agent_id, self.host)
+        try:
+            self.plugin_api.update_device_up(self.context, port_id,
+                                             self.agent_id, self.host)
+        except RuntimeError as e:
+            # the error is not critical. contiune.
+            LOG.warning("Failed to update_device_up: %s", e)
 
     def unplug(self, device_name, bridge=None, namespace=None, prefix=None):
         """Unplug the interface."""
@@ -85,8 +103,12 @@ class LagopusInterfaceDriver(n_interface.LinuxInterfaceDriver):
         tap_name = device_name.replace(prefix or self.DEV_NAME_PREFIX,
                                        n_const.TAP_DEVICE_PREFIX)
         try:
-            self.lagopus_api.unplug_rawsock(self.context, tap_name)
             device.link.delete()
+        except RuntimeError:
+            # note that the interface may not exist.
+            LOG.error("Failed deleting interface '%s'", device_name)
+        try:
+            self.lagopus_api.unplug_rawsock(self.context, tap_name)
             LOG.debug("Unplugged interface '%s'", device_name)
         except RuntimeError:
             LOG.error("Failed unplugging interface '%s'",

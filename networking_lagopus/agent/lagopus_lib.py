@@ -10,30 +10,19 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
-import socket
-
-from neutron_lib import constants as n_const
 from oslo_log import helpers as log_helpers
 from oslo_log import log as logging
 
 from networking_lagopus.agent import lagosh
 
 LOG = logging.getLogger(__name__)
-SOCKET_ISSUE = "Socket connection refused.  Lagopus is not running?\n"
 
 
 class LagopusCommand(object):
 
-    def _lagosh(self, cmd=None):
-        if not cmd:
-            return
+    def _lagosh(self, cmd):
         lagosh_client = lagosh.ds_client()
-        try:
-            return lagosh_client.call(cmd)
-        except socket.error:
-            LOG.debug("_lagosh socket error")
-        except lagosh.DSLError as e:
-            LOG.debug("_lagosh DSLError cmd: %s, error: %s", cmd, e)
+        return lagosh_client.call(cmd)
 
     def show_interfaces(self):
         cmd = "interface\n"
@@ -75,20 +64,10 @@ class LagopusCommand(object):
         cmd = "bridge %s enable\n" % name
         self._lagosh(cmd)
 
-    # TODO(hichihara): unify create_*_interface
     @log_helpers.log_method_call
-    def create_vhost_interface(self, name, device):
-        cmd = ("interface %s create -type ethernet-dpdk-phy "
-               "-device %s\n") % (name, device)
-        self._lagosh(cmd)
-
-    def create_pipe_interface(self, name, device):
-        self.create_vhost_interface(name, device)
-
-    @log_helpers.log_method_call
-    def create_rawsock_interface(self, name, device):
-        cmd = ("interface %s create -type ethernet-rawsock "
-               "-device %s\n") % (name, device)
+    def create_interface(self, name, dev_type, device):
+        cmd = ("interface %s create -type %s "
+               "-device %s\n") % (name, dev_type, device)
         self._lagosh(cmd)
 
     @log_helpers.log_method_call
@@ -116,17 +95,3 @@ class LagopusCommand(object):
     def bridge_del_port(self, bridge_name, port_name):
         cmd = "bridge %s config -port -%s\n" % (bridge_name, port_name)
         self._lagosh(cmd)
-
-    def find_bridge_port(self, port_id, bridge_name=None):
-        if port_id.startswith(n_const.TAP_DEVICE_PREFIX):
-            port_id = port_id[len(n_const.TAP_DEVICE_PREFIX):]
-        bridges = self.show_bridges()
-        for bridge in bridges:
-            if bridge_name and bridge["name"] != bridge_name:
-                continue
-            ports = bridge["ports"]
-            for port in ports:
-                port_name = port[1:]
-                if port_name.startswith(port_id):
-                    return bridge["name"], port_name
-        return None, None
