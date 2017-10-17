@@ -109,7 +109,7 @@ function unbind_nics() {
             addr=`echo $pair | cut -f 1 -d "#"`
             NICS="$NICS $addr"
         done
-        sudo $DPDK_DIR/usertools/dpdk-devbind.py -b e1000 $NICS
+        sudo $DPDK_DIR/usertools/dpdk-devbind.py --force -u $NICS
     fi
 }
 
