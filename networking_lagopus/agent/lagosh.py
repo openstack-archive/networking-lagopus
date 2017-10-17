@@ -232,10 +232,7 @@ class ds_client(object):
         self.request('unlock\n')
 
     def call(self, arg, response=True):
-        try:
-            self.open()
-        except Exception:
-            raise
+        self.open()
         self.write(arg)
         if response:
             jdata = self.read()

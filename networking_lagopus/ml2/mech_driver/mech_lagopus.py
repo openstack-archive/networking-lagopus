@@ -67,16 +67,17 @@ class LagopusMechanismDriver(mech_agent.SimpleAgentMechanismDriverBase):
 
     @log_helpers.log_method_call
     def update_port_postcommit(self, context):
-        if (context.original_host
-                and context.original_vif_type == 'vhostuser'
-                and not context.host and context.vif_type == 'unbound'):
+        if (context.original_host and not context.host
+                and context.original_vif_type in ('vhostuser',
+                                                  'binding_failed')):
             self.lagopus_api.unplug_vhost(self.context,
                                           context.current['id'],
                                           context.original_host)
 
     @log_helpers.log_method_call
     def delete_port_postcommit(self, context):
-        if context.host and context.vif_type == 'vhostuser':
+        if (context.host
+                and context.vif_type in ('vhostuser', 'binding_failed')):
             self.lagopus_api.unplug_vhost(self.context,
                                           context.current['id'],
                                           context.host)
