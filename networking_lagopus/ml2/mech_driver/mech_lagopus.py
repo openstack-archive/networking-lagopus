@@ -13,11 +13,10 @@
 from neutron_lib.api.definitions import portbindings
 from neutron_lib import constants
 from neutron_lib import context as n_context
+from neutron_lib.plugins.ml2 import api
 from oslo_log import helpers as log_helpers
 from oslo_log import log as logging
 
-from neutron.plugins.common import constants as p_constants
-from neutron.plugins.ml2 import driver_api as api
 from neutron.plugins.ml2.drivers import mech_agent
 
 from networking_lagopus.agent import rpc
@@ -38,7 +37,7 @@ class LagopusMechanismDriver(mech_agent.SimpleAgentMechanismDriverBase):
         self.lagopus_api = rpc.LagopusAgentApi()
 
     def get_allowed_network_types(self, agent=None):
-        return [p_constants.TYPE_FLAT, p_constants.TYPE_VLAN]
+        return [constants.TYPE_FLAT, constants.TYPE_VLAN]
 
     def get_mappings(self, agent):
         return agent['configurations'].get('bridge_mappings', {})
