@@ -6,8 +6,17 @@
 
 2. Copy the sample local.conf over::
 
-    cp devstack/local.conf.example local.conf
+    $ cp devstack/sample-local.conf local.conf
 
-3. Copy the lagopus_agent over::
+3. Run stack.sh::
 
-    cp devstack/lagopus_agent %{DEVSTACK_HOME}/lib/neutron_plugins/
+    $ ./stack.sh
+
+4. Edit libvirtd conf and restart::
+
+    $ sudo vi /etc/libvirt/qemu.conf
+    ...
+    security_driver = "none"
+    ...
+    $ sudo service libvirtd stop
+    $ sudo service libvirtd start
