@@ -14,6 +14,7 @@ import eventlet
 import os
 import sys
 
+from neutron_lib import constants
 from neutron_lib import context
 from neutron_lib.utils import helpers
 from oslo_config import cfg
@@ -29,7 +30,6 @@ from neutron.api.rpc.callbacks import resources
 from neutron.common import config as common_config
 from neutron.common import rpc as n_rpc
 from neutron.common import topics
-from neutron.plugins.common import constants as p_constants
 from neutron.plugins.ml2.drivers.agent import config as agent_config  # noqa
 
 from networking_lagopus.agent import lagopus_lib
@@ -311,7 +311,7 @@ class LagopusManager(object):
 
     def get_bridge(self, segment):
         vlan_id = (segment['segmentation_id']
-                   if segment['network_type'] == p_constants.TYPE_VLAN
+                   if segment['network_type'] == constants.TYPE_VLAN
                    else 0)
         phys_net = segment['physical_network']
         if phys_net not in self.phys_to_dpid:
