@@ -108,7 +108,7 @@ class LagopusCommand(object):
 
     @log_helpers.log_method_call
     def bridge_add_port(self, bridge_name, port_name, ofport):
-        cmd = ("bridge %s config -port %s %s\n" %
+        cmd = ("bridge %s config -port %s %d\n" %
                (bridge_name, port_name, ofport))
         self._lagosh(cmd)
 
