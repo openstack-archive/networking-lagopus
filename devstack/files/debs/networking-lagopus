@@ -7,3 +7,4 @@ byacc
 flex
 python-dev
 python-twisted
+libnuma-dev
