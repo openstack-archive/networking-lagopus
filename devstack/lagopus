@@ -35,7 +35,7 @@ function generate_dsl {
 function run_lagopus {
     echo "run_lagopus"
     generate_dsl
-    local command="sudo /usr/local/sbin/lagopus -d -C $LAGOPUS_CONF_DIR/$LAGOPUS_CONF -l $LAGOPUS_LOG -- -c$LAGOPUS_CORE_MASK -n$LAGOPUS_MEM_CHANNELS"
+    local command="/usr/local/sbin/lagopus -d -C $LAGOPUS_CONF_DIR/$LAGOPUS_CONF -- -c$LAGOPUS_CORE_MASK -n$LAGOPUS_MEM_CHANNELS"
     if [ -n "$LAGOPUS_SOCKET_MEM" ]; then
         command="$command --socket-mem $LAGOPUS_SOCKET_MEM"
     fi
@@ -43,13 +43,12 @@ function run_lagopus {
     if [ "$LAGOPUS_CORE_BALANCE" == "True" ]; then
         command="$command --core-assign balance"
     fi
-    eval ${command} &
+    _run_under_systemd lagopus "$command" "" root
 }
 
 function stop_lagopus {
     echo "stop_lagopus"
-    sudo pkill -15 -f "lagopus -C $LAGOPUS_CONF_DIR/$LAGOPUS_CONF"
-    sudo rm -f /tmp/sock*
+    sudo systemctl stop devstack@lagopus.service
 }
 
 function free_hugepages(){
