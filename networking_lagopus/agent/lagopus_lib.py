@@ -317,6 +317,40 @@ class LagopusBridge(LagopusResource):
 
         self.installed_vlan.append(vlan_id)
 
+    def uninstall_vlan(self, vlan_id, port):
+        if vlan_id not in self.installed_vlan:
+            return
+        ofport = port.ofport
+        ofp = self.datapath.ofproto
+        ofpp = self.datapath.ofproto_parser
+        vlan_vid = vlan_id | ofp.OFPVID_PRESENT
+
+        # pipe port -> phys port: push vlan, output:1
+        match = ofpp.OFPMatch(in_port=ofport)
+        msg = ofpp.OFPFlowMod(self.datapath,
+                              command=ofp.OFPFC_DELETE,
+                              table_id=0,
+                              priority=2,
+                              match=match,
+                              out_group=ofp.OFPG_ANY,
+                              out_port=ofp.OFPP_ANY)
+        # TODO(hichihara): error handling
+        ofctl_api.send_msg(self.ryu_app, msg)
+
+        # phys port -> pipe port: pop vlan, output:<ofport>
+        match = ofpp.OFPMatch(in_port=1, vlan_vid=vlan_vid)
+        msg = ofpp.OFPFlowMod(self.datapath,
+                              command=ofp.OFPFC_DELETE,
+                              table_id=0,
+                              priority=2,
+                              match=match,
+                              out_group=ofp.OFPG_ANY,
+                              out_port=ofp.OFPP_ANY)
+        # TODO(hichihara): error handling
+        ofctl_api.send_msg(self.ryu_app, msg)
+
+        self.installed_vlan.remove(vlan_id)
+
     def dump_flows(self):
         ofpp = self.datapath.ofproto_parser
         msg = ofpp.OFPFlowStatsRequest(self.datapath)
