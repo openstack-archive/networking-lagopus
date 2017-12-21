@@ -11,7 +11,6 @@
 #    under the License.
 
 import eventlet
-import os
 import socket
 import sys
 
@@ -155,8 +154,6 @@ class LagopusManager(object):
             if interface.type == lg_lib.INTERFACE_TYPE_VHOST:
                 self.num_vhost += 1
                 if not interface.is_used:
-                    sock_path = self._sock_path(interface.id)
-                    os.system("sudo chmod 777 %s" % sock_path)
                     self.free_vhost_interfaces.append(interface)
             elif interface.type == lg_lib.INTERFACE_TYPE_PIPE:
                 # only interested in even number
@@ -288,11 +285,10 @@ class LagopusManager(object):
     def create_vhost_interface(self, vhost_id):
         i_name = self.interfaces.mk_name(lg_lib.INTERFACE_TYPE_VHOST, vhost_id)
         sock_path = self._sock_path(vhost_id)
-        device = "eth_vhost%d,iface=%s" % (vhost_id, sock_path)
+        device = "eth_vhost%d,iface=%s,client=1" % (vhost_id, sock_path)
         interface = self.interfaces.create(i_name, lg_lib.DEVICE_TYPE_PHYS,
                                            device)
         LOG.debug("vhost %d added.", vhost_id)
-        os.system("sudo chmod 777 %s" % sock_path)
         return interface
 
     def get_vhost_interface(self):

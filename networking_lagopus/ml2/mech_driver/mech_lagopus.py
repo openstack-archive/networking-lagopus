@@ -52,7 +52,7 @@ class LagopusMechanismDriver(mech_agent.SimpleAgentMechanismDriverBase):
                 # use vhostuser for VM
                 vif_type = portbindings.VIF_TYPE_VHOST_USER
                 vif_details[portbindings.VHOST_USER_MODE] = (
-                    portbindings.VHOST_USER_MODE_CLIENT)
+                    portbindings.VHOST_USER_MODE_SERVER)
 
                 sock_path = self.lagopus_api.plug_vhost(
                     self.context, context.current['id'],
