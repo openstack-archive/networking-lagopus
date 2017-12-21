@@ -15,6 +15,8 @@ from oslo_config import cfg
 from networking_lagopus._i18n import _
 
 DEFAULT_BRIDGE_MAPPINGS = []
+DEFAULT_MAX_ETH_PORTS = 32
+DEFAULT_MAX_VLAN_NETWORKS = 0
 
 lagopus_opts = [
     cfg.BoolOpt('vhost_mode', default=True,
@@ -35,6 +37,11 @@ lagopus_opts = [
     cfg.PortOpt('of_listen_port', default=6633,
                 help=_("Port to listen on for OpenFlow connections. "
                        "Used only for 'native' driver.")),
+    cfg.IntOpt('max_eth_ports', default=DEFAULT_MAX_ETH_PORTS,
+               help=_("Max number of ether ports on a host.")),
+    cfg.IntOpt('max_vlan_networks', default=DEFAULT_MAX_VLAN_NETWORKS,
+               help=_("Max number of vlan networks available at the same "
+                      "time on a host.")),
 ]
 
 

@@ -146,23 +146,33 @@ class LagopusManager(object):
                 sys.exit(1)
             self.phys_to_bridge[phys_net] = self.bridges[name]
 
-        # vost_id and pipe_id management
-        self.free_vhost_interfaces = []
-        self.num_vhost = 0
-        max_pipe_num = 0
-        for interface in self.interfaces.values():
-            if interface.type == lg_lib.INTERFACE_TYPE_VHOST:
-                self.num_vhost += 1
-                if not interface.is_used:
-                    self.free_vhost_interfaces.append(interface)
-            elif interface.type == lg_lib.INTERFACE_TYPE_PIPE:
-                # only interested in even number
-                if interface.id % 2 == 0:
-                    max_pipe_num = max(max_pipe_num, interface.id)
-        self.next_pipe_id = max_pipe_num + 2
-
         # make initial dsl
         self._rebuild_dsl()
+
+        # vhost and pipe management
+        self.max_pipe_pairs = cfg.CONF.lagopus.max_vlan_networks
+        self.max_vhosts = (cfg.CONF.lagopus.max_eth_ports
+                           - self.max_pipe_pairs * 2
+                           - len(bridge_mappings))
+
+        self.free_vhost_interfaces = []
+        for vhost_id in range(self.max_vhosts):
+            interface = self._create_vhost_interface(vhost_id)
+            if not interface.is_used:
+                self.free_vhost_interfaces.append(interface)
+
+        used_pipe_id = []
+        for bridge in self.bridges.values():
+            if bridge.pipe_id is not None:
+                used_pipe_id.append(bridge.pipe_id)
+        self.pipe_pairs = {}
+        self.free_pipe_pairs = []
+        for i in range(self.max_pipe_pairs):
+            pipe_id = i * 2
+            pipe_pair = self._create_pipe_pair(pipe_id)
+            self.pipe_pairs[pipe_id] = pipe_pair
+            if pipe_id not in used_pipe_id:
+                self.free_pipe_pairs.append(pipe_pair)
 
     def _wait_lagopus_initialized(self):
         for retry in range(MAX_WAIT_LAGOPUS_RETRY):
@@ -200,7 +210,13 @@ class LagopusManager(object):
     def _sock_path(self, vhost_id):
         return "/tmp/sock%d" % vhost_id
 
-    def create_pipe_interfaces(self, pipe_id):
+    def _create_vhost_interface(self, vhost_id):
+        i_name = self.interfaces.mk_name(lg_lib.INTERFACE_TYPE_VHOST, vhost_id)
+        sock_path = self._sock_path(vhost_id)
+        device = "eth_vhost%d,iface=%s,client=1" % (vhost_id, sock_path)
+        return self.interfaces.create(i_name, lg_lib.DEVICE_TYPE_PHYS, device)
+
+    def _create_pipe_pair(self, pipe_id):
         i_name1 = self.interfaces.mk_name(lg_lib.INTERFACE_TYPE_PIPE, pipe_id)
         i_name2 = self.interfaces.mk_name(lg_lib.INTERFACE_TYPE_PIPE,
                                           pipe_id + 1)
@@ -212,27 +228,19 @@ class LagopusManager(object):
         inter2 = self.interfaces.create(i_name2, lg_lib.DEVICE_TYPE_PHYS,
                                         device2)
 
-        return inter1, inter2
-
-    def _get_pipe_id(self):
-        pipe_id = self.next_pipe_id
-        self.next_pipe_id += 2
-        return pipe_id
-
-    def create_pipe_ports(self, bridge):
-        if bridge.pipe_id is not None:
-            pipe_id = bridge.pipe_id
-        else:
-            pipe_id = self._get_pipe_id()
-
-        inter1, inter2 = self.create_pipe_interfaces(pipe_id)
-
-        p_name1 = self.ports.mk_name(lg_lib.INTERFACE_TYPE_PIPE, inter1.name)
-        p_name2 = self.ports.mk_name(lg_lib.INTERFACE_TYPE_PIPE, inter2.name)
+        p_name1 = self.ports.mk_name(lg_lib.INTERFACE_TYPE_PIPE, i_name1)
+        p_name2 = self.ports.mk_name(lg_lib.INTERFACE_TYPE_PIPE, i_name2)
         port1 = self.ports.create(p_name1, inter1)
         port2 = self.ports.create(p_name2, inter2)
 
-        return port1, port2
+        return (port1, port2)
+
+    def get_pipe_ports(self, bridge):
+        if bridge.pipe_id is not None:
+            return self.pipe_pairs[bridge.pipe_id]
+        if self.free_pipe_pairs:
+            return self.free_pipe_pairs.pop()
+        raise RuntimeError("too many networks.")
 
     def create_bridge(self, b_name, dpid):
         channel = self.channels.mk_name(b_name)
@@ -274,7 +282,7 @@ class LagopusManager(object):
             bridge.enable()
 
         # make sure there is pipe connection between phys_bridge
-        port1, port2 = self.create_pipe_ports(bridge)
+        port1, port2 = self.get_pipe_ports(bridge)
         self.bridge_add_port(bridge, port1)
         self.bridge_add_port(phys_bridge, port2)
 
@@ -282,30 +290,39 @@ class LagopusManager(object):
 
         return bridge
 
-    def create_vhost_interface(self, vhost_id):
-        i_name = self.interfaces.mk_name(lg_lib.INTERFACE_TYPE_VHOST, vhost_id)
-        sock_path = self._sock_path(vhost_id)
-        device = "eth_vhost%d,iface=%s,client=1" % (vhost_id, sock_path)
-        interface = self.interfaces.create(i_name, lg_lib.DEVICE_TYPE_PHYS,
-                                           device)
-        LOG.debug("vhost %d added.", vhost_id)
-        return interface
+    def put_bridge(self, bridge):
+        if bridge is None or bridge.type != lg_lib.BRIDGE_TYPE_VLAN:
+            return
+        if len(bridge.used_ofport) > 1:
+            return
 
-    def get_vhost_interface(self):
-        if self.free_vhost_interfaces:
-            return self.free_vhost_interfaces.pop()
+        port1, port2 = self.pipe_pairs[bridge.pipe_id]
+        phys_bridge = port2.bridge
 
-        # create new vhost interface
-        vhost_id = self.num_vhost
-        interface = self.create_vhost_interface(vhost_id)
-        self.num_vhost += 1
-        return interface
+        if phys_bridge:
+            vlan_id = bridge.dpid >> 48
+            phys_bridge.uninstall_vlan(vlan_id, port2)
+        self.bridge_del_port(port1)
+        self.bridge_del_port(port2)
+
+        self.bridges.destroy(bridge.name)
+        self.free_pipe_pairs.append((port1, port2))
 
     def create_vhost_port(self, p_name):
-        if p_name not in self.ports:
-            interface = self.get_vhost_interface()
-            self.ports.create(p_name, interface)
-        return self.ports[p_name]
+        if p_name in self.ports:
+            return self.ports[p_name]
+
+        if self.free_vhost_interfaces:
+            interface = self.free_vhost_interfaces.pop()
+        else:
+            raise RuntimeError("too many vhosts.")
+
+        return self.ports.create(p_name, interface)
+
+    def destroy_vhost_port(self, port):
+        interface = port.interface
+        self.ports.destroy(port.name)
+        self.free_vhost_interfaces.append(interface)
 
     @log_helpers.log_method_call
     def plug_vhost(self, context, **kwargs):
@@ -328,10 +345,10 @@ class LagopusManager(object):
         with self.serializer:
             port = self.ports.get(p_name)
             if port:
+                bridge = port.bridge
                 self.bridge_del_port(port)
-                interface = port.interface
-                self.ports.destroy(p_name)
-                self.free_vhost_interfaces.append(interface)
+                self.destroy_vhost_port(port)
+                self.put_bridge(bridge)
 
     @log_helpers.log_method_call
     def plug_rawsock(self, context, **kwargs):
@@ -357,9 +374,12 @@ class LagopusManager(object):
         p_name = self.ports.mk_name(lg_lib.INTERFACE_TYPE_RAWSOCK, device)
 
         with self.serializer:
-            self.bridge_del_port(self.ports.get(p_name))
+            port = self.ports.get(p_name)
+            bridge = port.bridge if port else None
+            self.bridge_del_port(port)
             self.ports.destroy(p_name)
             self.interfaces.destroy(i_name)
+            self.put_bridge(bridge)
 
 
 class LagopusAgent(service.Service):
