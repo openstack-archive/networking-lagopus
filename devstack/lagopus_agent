@@ -65,6 +65,8 @@ function neutron_plugin_configure_plugin_agent {
     fi
     iniset /$Q_PLUGIN_CONF_FILE lagopus max_eth_ports $LAGOPUS_MAX_ETH_PORTS
     iniset /$Q_PLUGIN_CONF_FILE lagopus max_vlan_networks $LAGOPUS_MAX_VLAN_NETWORKS
+    iniset /$Q_PLUGIN_CONF_FILE lagopus replace_dsl $LAGOPUS_REPLACE_DSL
+    iniset /$Q_PLUGIN_CONF_FILE lagopus lagopus_conf_path $LAGOPUS_CONF_DIR/$LAGOPUS_CONF
     iniset /$Q_PLUGIN_CONF_FILE securitygroup firewall_driver neutron.agent.firewall.NoopFirewallDriver
 }
 

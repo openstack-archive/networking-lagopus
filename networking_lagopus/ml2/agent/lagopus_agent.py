@@ -24,6 +24,7 @@ from oslo_service import loopingcall
 from oslo_service import service
 from osprofiler import profiler
 
+from neutron.agent.common import utils
 from neutron.agent.linux import ip_lib
 from neutron.agent import rpc as agent_rpc
 from neutron.api.rpc.callbacks import resources
@@ -146,9 +147,6 @@ class LagopusManager(object):
                 sys.exit(1)
             self.phys_to_bridge[phys_net] = self.bridges[name]
 
-        # make initial dsl
-        self._rebuild_dsl()
-
         # vhost and pipe management
         self.max_pipe_pairs = cfg.CONF.lagopus.max_vlan_networks
         self.max_vhosts = (cfg.CONF.lagopus.max_eth_ports
@@ -174,6 +172,16 @@ class LagopusManager(object):
             if pipe_id not in used_pipe_id:
                 self.free_pipe_pairs.append(pipe_pair)
 
+        # install vlan flow
+        for bridge in self.bridges.values():
+            if (bridge.type == lg_lib.BRIDGE_TYPE_VLAN and
+                    bridge.pipe_id is not None):
+                port2 = self.pipe_pairs[bridge.pipe_id][1]
+                phys_bridge = port2.bridge
+                if phys_bridge:
+                    vlan_id = bridge.dpid >> 48
+                    phys_bridge.install_vlan(vlan_id, port2)
+
     def _wait_lagopus_initialized(self):
         for retry in range(MAX_WAIT_LAGOPUS_RETRY):
             try:
@@ -186,10 +194,8 @@ class LagopusManager(object):
         sys.exit(1)
 
     def _rebuild_dsl(self):
-        # TODO(oda): just for backup now. it is able to restart lagopus
-        # uging this dsl manually. replace actual dsl in the future.
-        path = "/tmp/lagopus-backup.dsl"  # path is temporary
-        with open(path, "w") as f:
+        tmp_conf = "/tmp/lagopus-backup.dsl"
+        with open(tmp_conf, "w") as f:
             for obj in self.channels.values():
                 f.write(obj.create_str())
             for obj in self.controllers.values():
@@ -206,6 +212,10 @@ class LagopusManager(object):
                 f.write(obj.create_str())
                 if obj.bridge:
                     f.write(obj.add_bridge_str())
+
+        if cfg.CONF.lagopus.replace_dsl:
+            cmd = ["mv", tmp_conf, cfg.CONF.lagopus.lagopus_conf_path]
+            utils.execute(cmd, run_as_root=True)
 
     def _sock_path(self, vhost_id):
         return "/tmp/sock%d" % vhost_id
