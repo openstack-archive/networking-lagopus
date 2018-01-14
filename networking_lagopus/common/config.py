@@ -17,6 +17,7 @@ from networking_lagopus._i18n import _
 DEFAULT_BRIDGE_MAPPINGS = []
 DEFAULT_MAX_ETH_PORTS = 32
 DEFAULT_MAX_VLAN_NETWORKS = 0
+DEFAULT_LAGOPUS_CONF_PATH = "/usr/local/etc/lagopus/lagopus.dsl"
 
 lagopus_opts = [
     cfg.BoolOpt('vhost_mode', default=True,
@@ -42,6 +43,8 @@ lagopus_opts = [
     cfg.IntOpt('max_vlan_networks', default=DEFAULT_MAX_VLAN_NETWORKS,
                help=_("Max number of vlan networks available at the same "
                       "time on a host.")),
+    cfg.StrOpt('lagopus_conf_path', default=DEFAULT_LAGOPUS_CONF_PATH,
+               help=_("Path name of lagopus config file.")),
 ]
 
 
