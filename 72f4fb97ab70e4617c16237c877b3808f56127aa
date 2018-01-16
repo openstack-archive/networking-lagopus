@@ -1,0 +1,8 @@
+Code-Review+2: Hirofumi Ichihara <ichihara.hirofumi@gmail.com>
+Workflow+1: Hirofumi Ichihara <ichihara.hirofumi@gmail.com>
+Verified+2: Zuul
+Submitted-by: Zuul
+Submitted-at: Tue, 16 Jan 2018 08:21:12 +0000
+Reviewed-on: https://review.openstack.org/533432
+Project: openstack/networking-lagopus
+Branch: refs/heads/master
