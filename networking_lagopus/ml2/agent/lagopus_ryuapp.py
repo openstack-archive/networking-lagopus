@@ -14,6 +14,9 @@ from oslo_log import log as logging
 from oslo_utils import excutils
 import ryu.app.ofctl.api  # noqa
 from ryu.base import app_manager
+from ryu.controller.handler import DEAD_DISPATCHER
+from ryu.controller.handler import set_ev_cls
+from ryu.controller import ofp_event
 from ryu.lib import hub
 from ryu.ofproto import ofproto_v1_3
 
@@ -45,3 +48,10 @@ class LagopusAgentRyuApp(app_manager.RyuApp):
         super(LagopusAgentRyuApp, self).start()
         self.threads.append(hub.spawn(agent_main_wrapper, self,
                                       raise_error=True))
+
+    @set_ev_cls(ofp_event.EventOFPStateChange, DEAD_DISPATCHER)
+    def _handle_dead(self, ev):
+        dpid = ev.datapath.id
+        LOG.debug('del dpid %s', dpid)
+        if dpid is not None:
+            lagopus_agent.handle_dead(dpid)

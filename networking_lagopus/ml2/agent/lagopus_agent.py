@@ -11,6 +11,7 @@
 #    under the License.
 
 import eventlet
+import os
 import socket
 import sys
 
@@ -42,6 +43,8 @@ LOG = logging.getLogger(__name__)
 LAGOPUS_AGENT_BINARY = 'neutron-lagopus-agent'
 AGENT_TYPE_LAGOPUS = 'Lagopus agent'
 MAX_WAIT_LAGOPUS_RETRY = 5
+
+lagopus_dead_handler = None
 
 
 class LagopusCache(dict):
@@ -87,9 +90,12 @@ class LagopusManager(object):
         self.serializer = eventlet.semaphore.Semaphore()
 
         self._wait_lagopus_initialized()
-
         lg_lib.register_config_change_callback(self._rebuild_dsl)
+        self.build_cache()
+        register_dead_handler(self.lagopus_dead_handler)
+        self.lagopus_alive = True
 
+    def build_cache(self):
         # initialize device caches
         # channel
         self.channels = LagopusCache(lg_lib.LagopusChannel)
@@ -127,13 +133,13 @@ class LagopusManager(object):
         self.bridges = LagopusCache(lg_lib.LagopusBridge)
         raw_data = self.bridges.show()
         LOG.debug("bridges: %s", raw_data)
-        phys_bridge_names = bridge_mappings.values()
+        phys_bridge_names = self.bridge_mappings.values()
         for item in raw_data:
             b_name = item["name"]
             controller = item["controllers"][0][1:]  # remove ":"
             b_type = (lg_lib.BRIDGE_TYPE_PHYS if b_name in phys_bridge_names
                       else lg_lib.BRIDGE_TYPE_VLAN)
-            bridge = self.bridges.add(b_name, ryu_app, controller,
+            bridge = self.bridges.add(b_name, self.ryu_app, controller,
                                       item["dpid"], b_type, item["is-enabled"])
             for p_name, ofport in item["ports"].items():
                 port = self.ports[p_name[1:]]  # remove ":"
@@ -141,7 +147,7 @@ class LagopusManager(object):
 
         # check physical bridge existence
         self.phys_to_bridge = {}
-        for phys_net, name in bridge_mappings.items():
+        for phys_net, name in self.bridge_mappings.items():
             if name not in self.bridges:
                 LOG.error("Bridge %s not found.", name)
                 sys.exit(1)
@@ -151,7 +157,7 @@ class LagopusManager(object):
         self.max_pipe_pairs = cfg.CONF.lagopus.max_vlan_networks
         self.max_vhosts = (cfg.CONF.lagopus.max_eth_ports
                            - self.max_pipe_pairs * 2
-                           - len(bridge_mappings))
+                           - len(self.bridge_mappings))
 
         self.free_vhost_interfaces = []
         for vhost_id in range(self.max_vhosts):
@@ -336,6 +342,7 @@ class LagopusManager(object):
 
     @log_helpers.log_method_call
     def plug_vhost(self, context, **kwargs):
+        self.check_active()
         p_name = self.ports.mk_name(lg_lib.INTERFACE_TYPE_VHOST,
                                     kwargs['port_id'])
         segment = kwargs['segment']
@@ -349,6 +356,7 @@ class LagopusManager(object):
 
     @log_helpers.log_method_call
     def unplug_vhost(self, context, **kwargs):
+        self.check_active()
         p_name = self.ports.mk_name(lg_lib.INTERFACE_TYPE_VHOST,
                                     kwargs['port_id'])
 
@@ -362,6 +370,7 @@ class LagopusManager(object):
 
     @log_helpers.log_method_call
     def plug_rawsock(self, context, **kwargs):
+        self.check_active()
         device = kwargs['device']
         segment = kwargs['segment']
         i_name = self.interfaces.mk_name(lg_lib.INTERFACE_TYPE_RAWSOCK, device)
@@ -379,6 +388,7 @@ class LagopusManager(object):
 
     @log_helpers.log_method_call
     def unplug_rawsock(self, context, **kwargs):
+        self.check_active()
         device = kwargs['device']
         i_name = self.interfaces.mk_name(lg_lib.INTERFACE_TYPE_RAWSOCK, device)
         p_name = self.ports.mk_name(lg_lib.INTERFACE_TYPE_RAWSOCK, device)
@@ -390,6 +400,44 @@ class LagopusManager(object):
             self.ports.destroy(p_name)
             self.interfaces.destroy(i_name)
             self.put_bridge(bridge)
+
+    def lagopus_dead_handler(self, dpid):
+        for bridge in self.phys_to_bridge.values():
+            if dpid == bridge.dpid:
+                if self.lagopus_alive:
+                    # call once at first detected
+                    self.lagopus_alive = False
+                    eventlet.spawn_n(self.wait_lagopus_restart)
+
+    def wait_lagopus_restart(self):
+        LOG.warning("Detect lagopus down. wait lagopus restart.")
+
+        while True:
+            eventlet.sleep(10)
+            try:
+                lg_lib.LagopusChannel.show()
+                break
+            except Exception:
+                pass
+
+        LOG.info("lagopus restarted. initialize again...")
+        try:
+            self.build_cache()
+        except Exception:
+            LOG.error("Re-initialization failed.")
+            eventlet.sleep(0)  # to output log
+            # give up
+            os._exit(1)
+
+        LOG.info("Re-initialization done. now operate normaly.")
+        self.lagopus_alive = True
+
+    def is_active(self):
+        return self.lagopus_alive
+
+    def check_active(self):
+        if not self.lagopus_alive:
+            raise RuntimeError("lagopus is down.")
 
 
 class LagopusAgent(service.Service):
@@ -408,6 +456,7 @@ class LagopusAgent(service.Service):
     def start(self):
         self.context = context.get_admin_context_without_session()
         self.manager = LagopusManager(self.ryu_app, self.bridge_mappings)
+
         self.connection = n_rpc.create_connection()
         self.connection.create_consumer("q-lagopus", [self.manager])
 
@@ -433,6 +482,8 @@ class LagopusAgent(service.Service):
 
     def _report_state(self):
         try:
+            if not self.manager.is_active():
+                return
             devices = len(self.manager.ports)
             self.agent_state['configurations']['devices'] = devices
             self.state_rpc.report_state(self.context, self.agent_state, True)
@@ -462,6 +513,17 @@ def parse_bridge_mappings():
         LOG.error("Parsing bridge_mappings failed: %s. "
                   "Agent terminated!", e)
         sys.exit(1)
+
+
+def register_dead_handler(handler):
+    global lagopus_dead_handler
+    lagopus_dead_handler = handler
+
+
+def handle_dead(dpid):
+    global lagopus_dead_handler
+    if lagopus_dead_handler:
+        lagopus_dead_handler(dpid)
 
 
 def main(ryu_app):
