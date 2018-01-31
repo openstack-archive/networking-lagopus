@@ -15,6 +15,7 @@ import os
 import socket
 import sys
 
+from neutron_lib.api.definitions import portbindings
 from neutron_lib import constants
 from neutron_lib import context
 from neutron_lib.utils import helpers
@@ -27,6 +28,7 @@ from osprofiler import profiler
 
 from neutron.agent.common import utils
 from neutron.agent.linux import ip_lib
+from neutron.agent.metadata import agent as meta_agent
 from neutron.agent import rpc as agent_rpc
 from neutron.api.rpc.callbacks import resources
 from neutron.common import config as common_config
@@ -88,6 +90,8 @@ class LagopusManager(object):
         self.bridge_mappings = bridge_mappings
         self.ryu_app = ryu_app
         self.serializer = eventlet.semaphore.Semaphore()
+        self.plugin_rpc = meta_agent.MetadataPluginAPI(topics.PLUGIN)
+        self.context = context.get_admin_context_without_session()
 
         self._wait_lagopus_initialized()
         lg_lib.register_config_change_callback(self._rebuild_dsl)
@@ -187,6 +191,9 @@ class LagopusManager(object):
                 if phys_bridge:
                     vlan_id = bridge.dpid >> 48
                     phys_bridge.install_vlan(vlan_id, port2)
+
+        # start cleanup thread
+        eventlet.spawn_n(self.cleanup_unplugged_ports)
 
     def _wait_lagopus_initialized(self):
         for retry in range(MAX_WAIT_LAGOPUS_RETRY):
@@ -438,6 +445,33 @@ class LagopusManager(object):
     def check_active(self):
         if not self.lagopus_alive:
             raise RuntimeError("lagopus is down.")
+
+    def _rawsock_exists(self, device, port_ids):
+        device = device[3:]  # remove 'tap' prefix
+        for pid in port_ids:
+            if pid.startswith(device):
+                return True
+
+    def cleanup_unplugged_ports(self):
+        LOG.debug("Cleanup thread start.")
+        filters = {portbindings.HOST_ID: [cfg.CONF.host]}
+        ports = self.plugin_rpc.get_ports(self.context, filters=filters)
+        port_ids = [port['id'] for port in ports]
+        LOG.debug("Ports on the host: %s", port_ids)
+
+        for port in self.ports.values():
+            i_type = port.interface.type
+            if i_type == lg_lib.INTERFACE_TYPE_VHOST:
+                if port.name not in port_ids:
+                    LOG.debug("Unplugged port %s detected.", port.name)
+                    self.unplug_vhost(None, port_id=port.name)
+            elif i_type == lg_lib.INTERFACE_TYPE_RAWSOCK:
+                device = port.interface.device
+                if not self._rawsock_exists(device, port_ids):
+                    LOG.debug("Unplugged port %s detected.", port.name)
+                    self.unplug_rawsock(None, device=device)
+
+        LOG.debug("Cleanup thread end.")
 
 
 class LagopusAgent(service.Service):
