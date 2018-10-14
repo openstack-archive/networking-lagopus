@@ -44,7 +44,7 @@ lagopus_opts = [
                help=_("Max number of vlan networks available at the same "
                       "time on a host.")),
     cfg.BoolOpt('replace_dsl', default=False,
-                help=_("Replace lagopus.dsl when configration changed.")),
+                help=_("Replace lagopus.dsl when configuration changed.")),
     cfg.StrOpt('lagopus_conf_path', default=DEFAULT_LAGOPUS_CONF_PATH,
                help=_("Path name of lagopus config file.")),
 ]
