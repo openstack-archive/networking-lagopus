@@ -94,7 +94,7 @@ class LagopusInterfaceDriver(n_interface.LinuxInterfaceDriver):
             self.plugin_api.update_device_up(self.context, port_id,
                                              self.agent_id, self.host)
         except RuntimeError as e:
-            # the error is not critical. contiune.
+            # the error is not critical. continue.
             LOG.warning("Failed to update_device_up: %s", e)
 
     def unplug(self, device_name, bridge=None, namespace=None, prefix=None):
