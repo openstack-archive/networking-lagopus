@@ -1,8 +1,0 @@
-============================================
- networking_lagopus Release Notes
-============================================
-
-.. toctree::
-   :maxdepth: 1
-
-   unreleased
